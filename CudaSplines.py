@@ -5,10 +5,12 @@ class GPUSpline:
     def __init__(self,x,y):
         if not len(x) == len(y):
             raise Exception('x and y must have same shape!')
-        if np.any(np.diff(x) < 0):
-            x = np.sort(x)
-
+        
         h = x[1:] - x[:-1]
+        if np.any(h < 0):
+            x = np.sort(x)
+            h = x[1:] - x[:-1]        
+
         M = self.solveWeights(h,y)
         self.coefficients = self.calculateCoefficients(M,x,h,y)
 
@@ -54,12 +56,46 @@ class GPUSpline:
         inter_y = cuInterY.copy_to_host()
         return inter_y
     
+    def __len__(self):
+        return len(self.coefficients)
+    
+class GPUSplineVector(GPUSpline):
+
+    def __init__(self,x,y,targets):
+        self.splines = []
+        for dx,dy in zip(x,y):
+            self.splines.append(GPUSpline(dx,dy))   
+        if len(targets) != len(self.splines):
+            raise Exception('Length of targets must agree with number of spline functions!')
+        self.targets = np.array(targets,dtype=np.int64)
+
+    def toTensor(self, on_device=True):
+        max_coefs = max([len(s.coefficients) for s in self.splines])
+        self.tensor = np.zeros((len(self.splines),max_coefs,5),dtype=np.int64)
+        for i,s in enumerate(self.splines):
+            self.tensor[i,:len(s)] = s.toTensor()
+
+        if on_device:
+            cuCoef = cuda.to_device(self.tensor)
+            pos = np.zeros(len(self.splines),dtype=np.int64)
+            cuInputPos = cuda.to_device(pos)
+            cuTargets = cuda.to_device(self.targets)
+            return cuCoef,cuInputPos,cuTargets
+        else:
+            return self.tensor
+
+
 @cuda.jit(device=True)
 def interpolation_point_inline(coef,x,i):
     while x > coef[i+1,0]:
         i += 1
     x0,a1,a2,b,c = coef[i]  
     return a1*(coef[i+1,0] - x)**3 + a2*(x - x0)**3 + b*(x - x0) + c
+
+@cuda.jit(device=True) 
+def interpolation_vector_inline(inpCoef,t,inpPos,tarVec,inpTar):
+    for i,coef in zip(inpTar,inpCoef):
+        tarVec[i] = interpolation_point_inline(coef,t,inpPos)
 
 @cuda.jit
 def kernel(coef,x_array,y_array,int_pos):
