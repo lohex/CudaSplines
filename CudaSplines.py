@@ -77,13 +77,26 @@ class GPUSplineVector(GPUSpline):
 
         if on_device:
             cuCoef = cuda.to_device(self.tensor)
-            pos = np.zeros(len(self.splines),dtype=np.int64)
-            cuInputPos = cuda.to_device(pos)
             cuTargets = cuda.to_device(self.targets)
-            return cuCoef,cuInputPos,cuTargets
+            return cuCoef,cuTargets
         else:
             return self.tensor
+        
+    def eval(self,interpolate_x,threadsperblock=100):
+        n_interpolate = interpolate_x.shape[0]
+        n_dim = len(self.splines)
+        cuCoef,cuTar = self.toTensor(on_device=True)
+        int_pos = np.zeros((n_interpolate,n_dim),dtype=np.int64)
+        cuIntPos = cuda.to_device(int_pos)
+        cuXarray = cuda.to_device(interpolate_x)
+        y_array = np.zeros((*interpolate_x.shape,n_dim))
+        cuYarray = cuda.to_device(y_array)
 
+        blockspergrid = (interpolate_x.shape[0] + (threadsperblock - 1)) // threadsperblock
+        vector_kernel[blockspergrid,threadsperblock](cuCoef,cuXarray,cuYarray,cuIntPos,cuTar)
+        cuda.synchronize()
+        y_array = cuYarray.copy_to_host()
+        return y_array
 
 @cuda.jit(device=True)
 def interpolation_point_inline(coef,x,i):
@@ -94,8 +107,8 @@ def interpolation_point_inline(coef,x,i):
 
 @cuda.jit(device=True) 
 def interpolation_vector_inline(inpCoef,t,inpPos,tarVec,inpTar):
-    for i,coef in zip(inpTar,inpCoef):
-        tarVec[i] = interpolation_point_inline(coef,t,inpPos)
+    for k,coef,i in zip(inpTar,inpCoef,inpPos):
+        tarVec[k] = interpolation_point_inline(coef,t,i)
 
 @cuda.jit
 def kernel(coef,x_array,y_array,int_pos):
@@ -103,3 +116,10 @@ def kernel(coef,x_array,y_array,int_pos):
     if i < x_array.shape[0]:
         for k,dx in enumerate(x_array[i]):
             y_array[i,k] = interpolation_point_inline(coef,dx,int_pos[i])
+
+@cuda.jit
+def vector_kernel(coef,x_array,y_array,int_pos,tar):
+    i = cuda.grid(1)
+    if i < x_array.shape[0]:
+        for k,dx in enumerate(x_array[i]):
+            interpolation_vector_inline(coef,dx,int_pos[i],y_array[i,:,k],tar)
